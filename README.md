@@ -1,70 +1,55 @@
-# AI-Enhanced Web Vulnerability Scanner
+# CSEH Scanner v2.0
 
-This project scans a target website for basic security issues, runs anomaly detection on
-results using a simple machine learning model, assigns severity levels, and generates a report.
+## Overview  
+The CSEH Scanner v2.0 is an enterprise-grade scanning tool designed to assess system vulnerabilities and compliance with security standards. Built with scalability and reliability in mind, it provides comprehensive insights into your infrastructure's security posture.
+
+## Architecture  
+The system is designed using a microservices architecture that allows for efficient processing and scalability. Each component communicates through RESTful APIs, ensuring seamless interaction and integration. 
+
+### Components:
+- **Scanner Module:** Performs the actual scanning and data collection.
+- **Data Processor:** Analyses the collected data and generates reports.
+- **User Interface:** A web-based portal for users to interact with the scanner and view results.
 
 ## Features
 
 - Asynchronous crawling and scanning with `aiohttp` (JavaScript support via Selenium optional).
-- Hybrid payload engine combining curated safe payloads with AI‑assisted
-  selection and mutation.
-- Response analysis module that extracts features (reflection, errors,
-  timing deltas) for use by an external model.
-- `payload_database` holding categorised, non-destructive probes
-  (XSS, SQLi, directory traversal, open redirect, etc.).
-- `ai_selector` module to call a remote model which returns **strict JSON**
-  guidance on payload category, vulnerability type, mutation strategies and
-  priority score.
-- `mutation_engine` that can transform payloads (URL‑encode, case changes,
-  whitespace injection, etc.) based on AI recommendations.
-- Modular detectors for existing checks; new AI suggestion info is attached
-  to each finding and can influence priority scoring.
-- Enhanced reporting with detailed payload/evidence/priority information.
-- Example usage script demonstrating the advanced workflow.
-- Unit tests covering new components, written with `pytest`.
+- Plug‑in AI analyzer using `scikit-learn`.
+- Configurable severity thresholds.
+- JSON/CSV reporting with summary.
+- CLI interface with `argparse`.
+- Reflected XSS detection now exercises a list of common payloads (configurable via `VulnerabilityScanner`).
+- Built‑in tests leveraging `pytest` and `aiohttp`.
 
-Next sections remain unchanged but may have additional notes below.
-
-## Installation
-
-```bash
-python -m venv venv
-venv\Scripts\activate   # Windows
-pip install -r requirements.txt
-```
+## Installation  
+To install the CSEH Scanner, follow these steps:
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/krupal-savalia/VAPT-Automation-Tool.git
+   cd VAPT-Automation-Tool
+   ```
+2. Install dependencies:
+   ```bash
+   npm install
+   ```
+3. Configure the scanner:
+   Update the configuration file as per your infrastructure requirements.
+4. Start the application:
+   ```bash
+   npm start
+   ```
 
 ## Usage
 
-You can run the CLI (`cli.py`) as before.  To take advantage of the
-AI-assistance, set the `AI_API_URL` environment variable to point at your
-inference service and optionally `AI_API_KEY` for authentication.  The
-service **must** return JSON only, with the following fields:
-
-```json
-{
-  "vulnerability_type": "xss",
-  "payload_category": "xss",
-  "mutation_strategies": ["url_encode","case_mutation"],
-  "priority_score": 0.65
-}
-```
-
-Example CLI invocation:
-
 ```bash
-set AI_API_URL=https://model.company.local/predict
-set AI_API_KEY=secret123
-python cli.py https://example.com --depth 2 -f both -o reports/report
+# normal (fast) crawler
+python main.py https://example.com --depth 3 -f csv -o output.csv
+
+# enable JS rendering when scanning single-page apps
+python main.py https://example.com --depth 3 -j -f csv -o output.csv
 ```
 
-You can also run the demonstration script:
-
-```bash
-python example_usage.py https://example.com
-```
-
-> **Warning**: Only scan targets you have permission to test.  AI payloads
-> are designed to be safe/probing but may still trigger alarms.
+> **Warning**: Only scan targets you have permission to test.
 
 ## Development
 
@@ -79,26 +64,20 @@ Configure logging, extend scanners, and add new AI models by editing the modules
 
 ### Extending XSS Checks
 
-Under the new architecture XSS payloads are managed via the
-`payload_database` module and the scanner exposes a convenient
-`xss_payloads` parameter on construction.  You can supply your own list
-or modify the database directly:
+The scanner class accepts an optional `xss_payloads` list; you can provide
+additional or more aggressive vectors when creating
+``python
+from cseh.scanner import VulnerabilityScanner
+scanner = VulnerabilityScanner(xss_payloads=["<svg/onload=alert(1)>", ...])
+```
+This makes it easier to verify vulnerabilities with multiple proof-of-concept
+strings.
 
-```python
-from scanner import VulnerabilityScanner
-from scanner.payload_database import get_payloads
+The command‑line tool also exposes a `--xss-payload` argument which can be
+specified multiple times.  Extra payloads given on the command line are
+appended to the built‑in set before scanning:
 
-custom = ["<svg/onload=alert(1)>"]
-scanner = VulnerabilityScanner(target_url="https://foo", xss_payloads=custom)
-``` 
-
-The built‑in command‑line tool still supports `--xss-payload` to append
-extra payloads on the fly; they are combined with the default safe set.
-
-For more comprehensive control you may import `PAYLOAD_DB` and alter
-entries prior to scanning:
-
-```python
-from scanner.payload_database import PAYLOAD_DB
-PAYLOAD_DB['xss'].append("<img src=x onerror=alert('pwn')>")
+```bash
+python main.py http://example.com --xss-payload "<img src=x onerror=alert(1)>" \
+    --xss-payload "'><script>alert(1)</script>" 
 ```
