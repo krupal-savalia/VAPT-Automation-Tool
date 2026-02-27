@@ -6,12 +6,24 @@ results using a simple machine learning model, assigns severity levels, and gene
 ## Features
 
 - Asynchronous crawling and scanning with `aiohttp` (JavaScript support via Selenium optional).
-- Plug‑in AI analyzer using `scikit-learn`.
-- Configurable severity thresholds.
-- JSON/CSV reporting with summary.
-- CLI interface with `argparse`.
-- Reflected XSS detection now exercises a list of common payloads (configurable via `VulnerabilityScanner`).
-- Built‑in tests leveraging `pytest` and `aiohttp`.
+- Hybrid payload engine combining curated safe payloads with AI‑assisted
+  selection and mutation.
+- Response analysis module that extracts features (reflection, errors,
+  timing deltas) for use by an external model.
+- `payload_database` holding categorised, non-destructive probes
+  (XSS, SQLi, directory traversal, open redirect, etc.).
+- `ai_selector` module to call a remote model which returns **strict JSON**
+  guidance on payload category, vulnerability type, mutation strategies and
+  priority score.
+- `mutation_engine` that can transform payloads (URL‑encode, case changes,
+  whitespace injection, etc.) based on AI recommendations.
+- Modular detectors for existing checks; new AI suggestion info is attached
+  to each finding and can influence priority scoring.
+- Enhanced reporting with detailed payload/evidence/priority information.
+- Example usage script demonstrating the advanced workflow.
+- Unit tests covering new components, written with `pytest`.
+
+Next sections remain unchanged but may have additional notes below.
 
 ## Installation
 
@@ -23,15 +35,36 @@ pip install -r requirements.txt
 
 ## Usage
 
-```bash
-# normal (fast) crawler
-python main.py https://example.com --depth 3 -f csv -o output.csv
+You can run the CLI (`cli.py`) as before.  To take advantage of the
+AI-assistance, set the `AI_API_URL` environment variable to point at your
+inference service and optionally `AI_API_KEY` for authentication.  The
+service **must** return JSON only, with the following fields:
 
-# enable JS rendering when scanning single-page apps
-python main.py https://example.com --depth 3 -j -f csv -o output.csv
+```json
+{
+  "vulnerability_type": "xss",
+  "payload_category": "xss",
+  "mutation_strategies": ["url_encode","case_mutation"],
+  "priority_score": 0.65
+}
 ```
 
-> **Warning**: Only scan targets you have permission to test.
+Example CLI invocation:
+
+```bash
+set AI_API_URL=https://model.company.local/predict
+set AI_API_KEY=secret123
+python cli.py https://example.com --depth 2 -f both -o reports/report
+```
+
+You can also run the demonstration script:
+
+```bash
+python example_usage.py https://example.com
+```
+
+> **Warning**: Only scan targets you have permission to test.  AI payloads
+> are designed to be safe/probing but may still trigger alarms.
 
 ## Development
 
@@ -46,20 +79,26 @@ Configure logging, extend scanners, and add new AI models by editing the modules
 
 ### Extending XSS Checks
 
-The scanner class accepts an optional `xss_payloads` list; you can provide
-additional or more aggressive vectors when creating
-``python
-from cseh.scanner import VulnerabilityScanner
-scanner = VulnerabilityScanner(xss_payloads=["<svg/onload=alert(1)>", ...])
-```
-This makes it easier to verify vulnerabilities with multiple proof-of-concept
-strings.
+Under the new architecture XSS payloads are managed via the
+`payload_database` module and the scanner exposes a convenient
+`xss_payloads` parameter on construction.  You can supply your own list
+or modify the database directly:
 
-The command‑line tool also exposes a `--xss-payload` argument which can be
-specified multiple times.  Extra payloads given on the command line are
-appended to the built‑in set before scanning:
+```python
+from scanner import VulnerabilityScanner
+from scanner.payload_database import get_payloads
 
-```bash
-python main.py http://example.com --xss-payload "<img src=x onerror=alert(1)>" \
-    --xss-payload "'><script>alert(1)</script>" 
+custom = ["<svg/onload=alert(1)>"]
+scanner = VulnerabilityScanner(target_url="https://foo", xss_payloads=custom)
+``` 
+
+The built‑in command‑line tool still supports `--xss-payload` to append
+extra payloads on the fly; they are combined with the default safe set.
+
+For more comprehensive control you may import `PAYLOAD_DB` and alter
+entries prior to scanning:
+
+```python
+from scanner.payload_database import PAYLOAD_DB
+PAYLOAD_DB['xss'].append("<img src=x onerror=alert('pwn')>")
 ```

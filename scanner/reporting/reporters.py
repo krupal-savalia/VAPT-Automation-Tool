@@ -35,6 +35,21 @@ class JSONReporter:
             },
             'scan': scan_result.to_dict(),
         }
+        # add a convenience section with the most relevant fields for each
+        # finding, as requested by the enhancement requirements.
+        report_data['scan']['detailed_findings'] = []
+        for vuln in report_data['scan']['vulnerabilities']:
+            entry = {
+                'vulnerability_type': vuln.get('type'),
+                'severity': vuln.get('severity'),
+                'priority_score': vuln.get('metadata', {}).get('priority_score'),
+                'tested_payload': None,
+                'evidence': vuln.get('evidence'),
+            }
+            # try to pull payload from first evidence item
+            if vuln.get('evidence') and isinstance(vuln['evidence'], list):
+                entry['tested_payload'] = vuln['evidence'][0].get('payload_used')
+            report_data['scan']['detailed_findings'].append(entry)
         
         with open(output_file, 'w', encoding='utf-8') as f:
             json.dump(report_data, f, indent=2, ensure_ascii=False)
@@ -60,6 +75,7 @@ class HTMLReporter:
         """Build HTML content."""
         criticality_badge = self._get_criticality_badge(scan_result)
         vulnerabilities_html = self._build_vulnerabilities_html(scan_result)
+        # priority and payload details will be included in _build_vulnerabilities_html
         
         return f"""
 <!DOCTYPE html>
@@ -166,11 +182,18 @@ class HTMLReporter:
         html = ""
         for vuln in scan_result.vulnerabilities:
             severity_lower = vuln.severity.value.lower()
+            # grab tested payload if available
+            tested = None
+            if vuln.evidence:
+                tested = vuln.evidence[0].payload_used
+            priority = vuln.metadata.get('priority_score', None) if hasattr(vuln, 'metadata') else None
             html += f"""
             <div class="vulnerability {severity_lower}">
                 <span class="badge {severity_lower}">{vuln.severity.value}</span>
                 <h3>{vuln.title}</h3>
                 <p><strong>URL:</strong> {vuln.target_url}</p>
+                {f'<p><strong>Payload:</strong> {tested}</p>' if tested else ''}
+                {f'<p><strong>Priority Score:</strong> {priority}</p>' if priority is not None else ''}
                 <p><strong>Description:</strong> {vuln.description}</p>
                 <p><strong>CVSS Score:</strong> {vuln.cvss_score} | <strong>Confidence:</strong> {vuln.confidence:.1%}</p>
                 {f'<p><strong>Remediation:</strong> {vuln.remediation}</p>' if vuln.remediation else ''}

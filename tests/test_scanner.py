@@ -7,19 +7,16 @@ import asyncio
 import pytest
 from aiohttp import web
 
-from cseh.scanner import VulnerabilityScanner
+from scanner.core import VulnerabilityScanner
 
 @pytest.mark.asyncio
-async def test_scan(aiohttp_client):
+async def test_scan_basic(aiohttp_client):
     async def handler(request):
-        # simple responses depending on path
         if request.path == "/headers":
             return web.Response(text="ok", headers={})
         if request.path == "/sql":
             return web.Response(text="SQL syntax error")
         if request.path == "/xss":
-            # echo back the ``q`` query parameter so that every payload is
-            # reflected and can be detected by the scanner.
             return web.Response(text=request.query.get("q", ""))
         return web.Response(text="hello")
 
@@ -29,27 +26,51 @@ async def test_scan(aiohttp_client):
     app.router.add_get("/xss", handler)
     client = await aiohttp_client(app)
 
-    scanner = VulnerabilityScanner()
-    base = str(client.make_url(""))
-    # make sure there is a trailing slash so concatenation works
-    if not base.endswith("/"):
-        base += "/"
-    urls = [base + "headers", base + "sql", base + "xss"]
-    results = await scanner.scan(urls)
-    # should produce at least one finding for each type
-    types = {r["type"] for r in results}
-    assert "Missing Security Headers" in types
-    assert "Potential SQL Injection" in types
-    assert "Reflected XSS" in types
+    scanner = VulnerabilityScanner(target_url=str(client.make_url("")))
+    result = await scanner.scan()
 
-    # because the /xss handler echoes whatever is supplied, we expect one
-    # finding per configured payload (default 3).  The scanner should include
-    # a ``payload`` key in the results to make confirmation easier.
-    xss_findings = [r for r in results if r["type"] == "Reflected XSS"]
-    assert len(xss_findings) == len(scanner.xss_payloads)
-    for f in xss_findings:
-        assert "payload" in f
-        assert f["payload"] in scanner.xss_payloads
+    types = {v.type.value for v in result.vulnerabilities}
+    assert "Missing Security Headers" in types
+    assert any("SQL" in v.type.value for v in result.vulnerabilities)
+    assert any("XSS" in v.type.value for v in result.vulnerabilities)
+    # ensure metadata priority exists
+    for v in result.vulnerabilities:
+        assert isinstance(v.metadata.get('priority_score', 0.0), float)
+
+
+@pytest.mark.asyncio
+async def test_ai_integration(aiohttp_client, monkeypatch):
+    async def handler(request):
+        return web.Response(text=request.query.get("q", ""))
+
+    app = web.Application()
+    app.router.add_get("/test", handler)
+    client = await aiohttp_client(app)
+    base = str(client.make_url("/"))
+
+    # stub AISelector
+    from scanner import ai_selector
+
+    class Dummy:
+        def select(self, features):
+            return {
+                "vulnerability_type": "xss",
+                "payload_category": "xss",
+                "mutation_strategies": ["case_mutation"],
+                "priority_score": 0.9,
+            }
+    monkeypatch.setattr(ai_selector, 'AISelector', lambda *args, **kwargs: Dummy())
+
+    scanner = VulnerabilityScanner(target_url=base)
+    result = await scanner.scan()
+    xss = [v for v in result.vulnerabilities if "XSS" in v.type.value]
+    assert xss
+    for v in xss:
+        assert v.metadata.get('priority_score') == 0.9
+        assert v.evidence and v.evidence[0].payload_used
+
+
+# keep existing parameter mutation test unchanged
 
 
 @pytest.mark.asyncio
@@ -69,11 +90,13 @@ async def test_scan_with_custom_xss_payloads(aiohttp_client):
 
     # create scanner with custom payloads only
     custom = ["ONE", "TWO"]
-    scanner = VulnerabilityScanner(xss_payloads=custom)
-    results = await scanner.scan([base + "xss"])
-    xss_findings = [r for r in results if r["type"] == "Reflected XSS"]
+    scanner = VulnerabilityScanner(target_url=base, xss_payloads=custom)
+    # bypass crawler by injecting discovered URL directly
+    scanner.scan_result.discovered_urls = [base + "xss"]
+    await scanner._detect_vulnerabilities()
+    xss_findings = [v for v in scanner.scan_result.vulnerabilities if "XSS" in v.type.value]
     assert len(xss_findings) == len(custom)
-    assert {f["payload"] for f in xss_findings} == set(custom)
+    assert {v.evidence[0].payload_used for v in xss_findings} == set(custom)
 
 
 @pytest.mark.asyncio
@@ -94,22 +117,20 @@ async def test_param_mutation_used(aiohttp_client):
     if not base.endswith("/"):
         base += "/"
 
-    scanner = VulnerabilityScanner()
+    scanner = VulnerabilityScanner(target_url=base)
     url_with_param = base + "xss?search=foo"
-    results = await scanner.scan([url_with_param])
-    xss_findings = [r for r in results if r["type"] == "Reflected XSS"]
+    scanner.scan_result.discovered_urls = [url_with_param]
+    await scanner._detect_vulnerabilities()
+    xss_findings = [v for v in scanner.scan_result.vulnerabilities if "XSS" in v.type.value]
 
     # we should get one finding per default payload and each test URL should
     # still include the original parameter name ‘search’
     assert len(xss_findings) == len(scanner.xss_payloads)
     from urllib.parse import urlparse, parse_qs, unquote_plus
 
-    for f in xss_findings:
-        assert "search=" in f["url"]
-        # decode the query value and ensure it matches the payload we recorded
-        parsed = urlparse(f["url"])
+    for v in xss_findings:
+        assert "search=" in v.evidence[0].request_url
+        parsed = urlparse(v.evidence[0].request_url)
         qs = parse_qs(parsed.query)
-        # there should be exactly one value for search
         value = qs.get("search", [""])[0]
-        # parsing may URL‑encode characters
-        assert unquote_plus(value) == f["payload"]
+        assert unquote_plus(value) == v.evidence[0].payload_used

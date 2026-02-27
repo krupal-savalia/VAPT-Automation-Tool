@@ -28,6 +28,12 @@ from .utils.models import ScanResult, Vulnerability
 from .utils.logging_util import setup_logging
 from .utils.http_client import HTTPClient
 
+# new helpers for AI-assisted scanning
+from .payload_database import get_payloads
+from .response_analyzer import ResponseAnalyzer
+from .ai_selector import AISelector
+from .mutation_engine import MutationEngine
+
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +57,7 @@ class VulnerabilityScanner:
         use_js: bool = False,
         timeout: int = 30,
         log_level: str = "INFO",
+        xss_payloads: Optional[List[str]] = None,
     ):
         """
         Initialize the scanner.
@@ -91,6 +98,9 @@ class VulnerabilityScanner:
         self.http_client = HTTPClient(timeout=timeout)
         self.risk_engine = RiskEngine()
         
+        # allow custom xss payload list or default from database
+        self.xss_payloads = xss_payloads if xss_payloads is not None else get_payloads('xss')
+
         # Initialize detectors
         self.detectors = [
             # Injection detectors
@@ -115,6 +125,14 @@ class VulnerabilityScanner:
         
         # Results
         self.scan_result = ScanResult(target_url=target_url)
+
+        # baseline responses for comparison during analysis
+        self._baseline_responses: Dict[str, Dict] = {}
+
+        # AI/analysis helpers
+        self.response_analyzer = ResponseAnalyzer()
+        self.ai_selector = AISelector()
+        self.mutation_engine = MutationEngine()
         
     async def scan(self) -> ScanResult:
         """
@@ -175,170 +193,196 @@ class VulnerabilityScanner:
             self.logger.error(f"Crawling failed: {e}", exc_info=True)
             
     async def _detect_vulnerabilities(self):
-        """Test discovered URLs and forms for vulnerabilities."""
+        """Test discovered URLs and forms for vulnerabilities.
+
+        The method has been significantly enhanced to make use of the
+        payload database, response analysis and AI-assisted mutation.  It
+        still preserves the original detectors for backwards compatibility.
+        """
         try:
-            # Test URLs with GET requests
             urls_to_test = self.scan_result.discovered_urls
             self.logger.info(f"Testing {len(urls_to_test)} URLs")
-            
+
+            # fetch a baseline response for each unique clean URL (no query params)
+            from urllib.parse import urlparse
+
             for url in urls_to_test:
-                self.logger.debug(f"Testing {url}")
-                
-                # Get response
-                response = await self.http_client.request(url)
-                
-                if response.get('error'):
-                    self.logger.warning(f"Failed to fetch {url}")
-                    continue
-                    
-                # Prepare evidence dictionary
+                clean = url.split('?', 1)[0]
+                if clean not in self._baseline_responses:
+                    try:
+                        resp = await self.http_client.request(clean)
+                        self.scan_result.total_payloads_sent += 1
+                        self._baseline_responses[clean] = resp
+                    except asyncio.CancelledError:
+                        self.logger.warning(f"Baseline request cancelled for {clean}")
+                        self._baseline_responses[clean] = {}
+                    except asyncio.TimeoutError:
+                        self.logger.warning(f"Baseline request timeout for {clean}")
+                        self._baseline_responses[clean] = {}
+                    except Exception as e:
+                        self.logger.debug(f"Failed to fetch baseline for {clean}: {e}")
+                        self._baseline_responses[clean] = {}
+
+            # helper closure to process any response, run detectors and AI
+            async def _evaluate(url: str, baseline: Dict, payload: str, extra_evidence: Dict[str, Any], response: Dict[str, Any]):
+                # build full evidence
                 evidence = {
                     'request_url': url,
-                    'request_method': 'GET',
+                    'request_method': extra_evidence.get('request_method', 'GET'),
                     'response_status': response.get('status', 0),
                     'response_headers': response.get('headers', {}),
                     'response_body': response.get('body', ''),
                     'response_length': len(response.get('body', '')),
+                    'injection_point': extra_evidence.get('injection_point'),
+                    'payload_used': payload,
                 }
-                
-                # Run all detectors on page
+                # attach ai decision information if available
+                features = self.response_analyzer.analyze(response, baseline, payload)
+                ai_decision = self.ai_selector.select(features)
+                evidence['ai_decision'] = ai_decision
+                evidence['metadata'] = {'priority_score': ai_decision.get('priority_score', 0.0)}
+
+                # run detectors
                 for detector in self.detectors:
                     try:
                         findings = await detector.detect(url, evidence)
+                        # enrich each finding with priority if not already set
+                        for f in findings:
+                            if not f.metadata:
+                                f.metadata = {}
+                            f.metadata.setdefault('priority_score', ai_decision.get('priority_score', 0.0))
                         self.scan_result.vulnerabilities.extend(findings)
                     except Exception as e:
-                        self.logger.warning(f"Detector {detector.name} failed on {url}: {e}")
-            
-            # Test discovered forms with injection payloads
+                        self.logger.debug(f"Detector {detector.name} failed during evaluation: {e}")
+
+                # if AI suggested mutation strategies, generate and re-test once
+                if ai_decision.get('mutation_strategies'):
+                    mutated = self.mutation_engine.mutate(payload, ai_decision['mutation_strategies'])
+                    for mp in mutated:
+                        try:
+                            # simple re-request with mutated payload using same params or body
+                            if extra_evidence.get('request_method', 'GET') == 'POST':
+                                new_resp = await self.http_client.request(url, method="POST", data=extra_evidence.get('data'))
+                            else:
+                                new_resp = await self.http_client.request(url, params={extra_evidence.get('injection_point'): mp})
+                            self.scan_result.total_payloads_sent += 1
+                            # run detectors again but don't loop into AI again
+                            new_evidence = evidence.copy()
+                            new_evidence['payload_used'] = mp
+                            for detector in self.detectors:
+                                try:
+                                    findings = await detector.detect(url, new_evidence)
+                                    self.scan_result.vulnerabilities.extend(findings)
+                                except Exception:
+                                    pass
+                        except (asyncio.CancelledError, asyncio.TimeoutError):
+                            self.logger.debug(f"Timeout on mutated payload")
+                            continue
+                        except Exception:
+                            pass
+
+            # iterate over each discovered URL for baseline tests plus checks
+            from urllib.parse import urlparse, parse_qs
+
+            for url in urls_to_test:
+                parsed = urlparse(url)
+                clean = parsed.scheme + "://" + parsed.netloc + parsed.path
+                baseline = self._baseline_responses.get(clean, {})
+
+                # check query parameters if present
+                params = parse_qs(parsed.query)
+                if params:
+                    for param_name, values in params.items():
+                        payloads = get_payloads('sqli_error') + get_payloads('sqli_boolean') + self.xss_payloads
+                        for payload in payloads:
+                            test_params = {k: (payload if k == param_name else v[0]) for k, v in params.items()}
+                            try:
+                                resp = await self.http_client.request(clean, method="GET", params=test_params)
+                                self.scan_result.total_payloads_sent += 1
+                                if resp.get('error'):
+                                    continue
+                                await _evaluate(url, baseline, payload, {'request_method': 'GET', 'injection_point': param_name}, resp)
+                            except (asyncio.CancelledError, asyncio.TimeoutError):
+                                self.logger.debug(f"Timeout testing {param_name}")
+                                continue
+                            except Exception:
+                                pass
+
+                # directory traversal probes
+                for payload in get_payloads('dir_traversal'):
+                    target = clean + payload
+                    try:
+                        resp = await self.http_client.request(target)
+                        self.scan_result.total_payloads_sent += 1
+                        if not resp.get('error'):
+                            await _evaluate(target, baseline, payload, {'request_method': 'GET'}, resp)
+                    except (asyncio.CancelledError, asyncio.TimeoutError):
+                        self.logger.debug(f"Timeout on {target}")
+                        continue
+                    except Exception:
+                        pass
+
+                # open redirect probes (append as ?next=... or similar)
+                for payload in get_payloads('open_redirect'):
+                    try:
+                        resp = await self.http_client.request(clean, method="GET", params={'next': payload})
+                        self.scan_result.total_payloads_sent += 1
+                        if not resp.get('error'):
+                            await _evaluate(url, baseline, payload, {'request_method': 'GET', 'injection_point': 'next'}, resp)
+                    except (asyncio.CancelledError, asyncio.TimeoutError):
+                        self.logger.debug(f"Timeout on redirect probe")
+                        continue
+                    except Exception:
+                        pass
+
+                # unsafe HTTP methods
+                for method in get_payloads('http_methods'):
+                    try:
+                        resp = await self.http_client.request(clean, method=method)
+                        self.scan_result.total_payloads_sent += 1
+                        if resp.get('status', 0) not in (405, 501):
+                            evidence = {
+                                'request_url': clean,
+                                'request_method': method,
+                                'response_status': resp.get('status', 0),
+                                'response_body': resp.get('body', ''),
+                            }
+                            # record as potential misconfiguration
+                            for detector in self.detectors:
+                                if isinstance(detector, HTTPMethodDetector):
+                                    findings = await detector.detect(clean, evidence)
+                                    self.scan_result.vulnerabilities.extend(findings)
+                    except (asyncio.CancelledError, asyncio.TimeoutError):
+                        self.logger.debug(f"Timeout testing {method}")
+                        continue
+                    except Exception:
+                        pass
+
+            # forms submission (previous behaviour, but using payload database)
             forms_to_test = self.crawler.discovered_forms
             self.logger.info(f"Testing {len(forms_to_test)} forms with injection payloads")
-            
-            test_payloads = [
-                # SQL Injection - Most important
-                "' OR '1'='1",
-                "' OR 1=1--",
-                "admin' --",
-                "' UNION SELECT NULL--",
-                
-                # XSS Attacks
-                "<img src=x onerror=alert('xss')>",
-                "\"><script>alert('xss')</script>",
-                "<svg/onload=alert('xss')>",
-                
-                # Command Injection
-                ";id",
-                "|id",
-                
-                # SSTI/Template
-                "${7*7}",
-                "{{7*7}}",
-                
-                # Other
-                "../../../etc/passwd",
-                "{'$ne': null}",
-            ]
-            
-            
+
             for form in forms_to_test:
-                # Make URL absolute if action is relative
                 form_url = urljoin(form.url, form.action) if form.action else form.url
-                self.logger.info(f"Testing form: {form.method} {form_url} with {len(form.fields)} fields")
-                
-                # Test each form field with payloads
                 for field in form.fields:
-                    for payload in test_payloads:
+                    payloads = get_payloads('sqli_error') + self.xss_payloads
+                    for payload in payloads:
                         try:
-                            # Prepare form data
                             form_data = {f['name']: payload for f in form.fields}
-                            
-                            # Send request with payload
                             if form.method.upper() == "POST":
-                                response = await self.http_client.request(
-                                    form_url,
-                                    method="POST",
-                                    data=form_data
-                                )
+                                resp = await self.http_client.request(form_url, method="POST", data=form_data)
                             else:
-                                response = await self.http_client.request(
-                                    form_url,
-                                    method="GET",
-                                    params=form_data
-                                )
-                            
-                            if response.get('error'):
+                                resp = await self.http_client.request(form_url, method="GET", params=form_data)
+                            self.scan_result.total_payloads_sent += 1
+                            if resp.get('error'):
                                 continue
-                            
-                            # Prepare evidence
-                            evidence = {
-                                'request_url': form_url,
-                                'request_method': form.method.upper(),
-                                'response_status': response.get('status', 0),
-                                'response_headers': response.get('headers', {}),
-                                'response_body': response.get('body', ''),
-                                'response_length': len(response.get('body', '')),
-                                'injection_point': field['name'],
-                                'payload_used': payload,
-                            }
-                            
-                            # Run injection detectors
-                            for detector in self.detectors:
-                                if 'Injection' in detector.__class__.__name__ or 'XSS' in detector.__class__.__name__:
-                                    try:
-                                        findings = await detector.detect(form_url, evidence)
-                                        self.scan_result.vulnerabilities.extend(findings)
-                                    except Exception as e:
-                                        self.logger.debug(f"Detector failed: {e}")
-                                        
-                        except Exception as e:
-                            self.logger.debug(f"Error testing form field {field['name']}: {e}")
-            
-            # Test URL query parameters with payloads
-            self.logger.info(f"Testing URL parameters from discovered URLs")
-            from urllib.parse import urlparse, parse_qs
-            
-            tested_params = set()
-            for url in self.crawler.visited_urls:
-                try:
-                    parsed = urlparse(url)
-                    params = parse_qs(parsed.query)
-                    
-                    if params:
-                        for param_name in params.keys():
-                            param_key = f"{url}#{param_name}"
-                            if param_key not in tested_params:
-                                tested_params.add(param_key)
-                                
-                                # Test this parameter with payloads
-                                for payload in test_payloads[:10]:  # Limit to first 10 payloads per param
-                                    try:
-                                        test_params = {k: (payload if k == param_name else v[0]) for k, v in params.items()}
-                                        response = await self.http_client.request(url.split('?')[0], method="GET", params=test_params)
-                                        
-                                        if not response.get('error'):
-                                            evidence = {
-                                                'request_url': url,
-                                                'request_method': 'GET',
-                                                'response_status': response.get('status', 0),
-                                                'response_headers': response.get('headers', {}),
-                                                'response_body': response.get('body', ''),
-                                                'response_length': len(response.get('body', '')),
-                                                'injection_point': param_name,
-                                                'payload_used': payload,
-                                            }
-                                            
-                                            # Run injection-specific detectors
-                                            for detector in self.detectors:
-                                                if any(x in detector.name for x in ['Injection', 'XSS', 'Command', 'SSTI', 'IDOR', 'Authentication']):
-                                                    try:
-                                                        findings = await detector.detect(url, evidence)
-                                                        self.scan_result.vulnerabilities.extend(findings)
-                                                    except Exception as e:
-                                                        self.logger.debug(f"Detector failed on param: {e}")
-                                    except Exception:
-                                        pass
-                except Exception:
-                    pass
-                    
+                            await _evaluate(form_url, baseline, payload, {'request_method': form.method.upper(), 'injection_point': field['name'], 'data': form_data}, resp)
+                        except (asyncio.CancelledError, asyncio.TimeoutError):
+                            self.logger.debug(f"Timeout on form {form_url}")
+                            continue
+                        except Exception:
+                            pass
+
         except Exception as e:
             self.logger.error(f"Vulnerability detection failed: {e}", exc_info=True)
             

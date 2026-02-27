@@ -60,6 +60,7 @@ class Vulnerability:
     discovered_at: datetime = field(default_factory=datetime.utcnow)
     scanner_module: str = ""
     iterations: int = 1  # Number of test attempts
+    metadata: Dict[str, Any] = field(default_factory=dict)  # AI/priority info
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to JSON-serializable dictionary."""
