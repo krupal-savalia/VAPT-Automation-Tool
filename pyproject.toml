@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cseh"
+version = "0.1.0"
+description = "AI-enhanced web vulnerability scanner"
+authors = [
+    {name = "Your Name", email = "you@example.com"}
+]
+license = {text = "MIT"}
+readme = "README.md"
+requires-python = ">=3.8"
+
+[project.dependencies]
+aiohttp = "*"
+beautifulsoup4 = "*"
+requests = "*"
+selenium = "*"
+webdriver-manager = "*"
+scikit-learn = "*"
+numpy = "*"
+colorama = "*"
+joblib = "*"
+
+[project.optional-dependencies]
+testing = ["pytest", "pytest-aiohttp"]
