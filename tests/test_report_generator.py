@@ -64,3 +64,58 @@ def test_summary():
     assert summary["total"] == 2
     assert summary["high"] == 1
     assert summary["low"] == 1
+
+
+def make_vuln(type_str, url):
+    from scanner.utils.models import Vulnerability, Severity, Evidence
+    from scanner.utils.constants import VulnerabilityType
+    # allow passing either enum or raw value string
+    if isinstance(type_str, VulnerabilityType):
+        type_enum = type_str
+    else:
+        type_enum = VulnerabilityType(type_str)
+    # simple vuln with minimal fields
+    return Vulnerability(
+        type=type_enum,
+        target_url=url,
+        title=type_enum.value,
+        description="desc",
+        severity=Severity.MEDIUM,
+        confidence=0.5,
+        evidence=[Evidence(request_url=url)]
+    )
+
+@pytest.mark.asyncio
+async def test_html_report_groups_duplicates(tmp_path):
+    # create a fake ScanResult with duplicate vulnerabilities
+    from scanner.utils.models import ScanResult
+    from scanner.reporting.reporters import HTMLReporter
+
+    scan = ScanResult(target_url="http://example")
+    # two identical vulnerabilities should be grouped into one entry with count
+    scan.vulnerabilities.append(make_vuln("Reflected XSS", "http://example/page"))
+    scan.vulnerabilities.append(make_vuln("Reflected XSS", "http://example/page"))  # duplicate
+    scan.scan_start_time = scan.scan_start_time  # ensure attribute exists
+
+    reporter = HTMLReporter()
+    html = reporter._build_vulnerabilities_html(scan)
+    # should mention that there are 2 similar findings grouped
+    assert "2 similar" in html or "occurrences" in html
+
+@pytest.mark.asyncio
+async def test_json_report_includes_occurrences(tmp_path):
+    from scanner.utils.models import ScanResult
+    from scanner.reporting.reporters import JSONReporter
+
+    scan = ScanResult(target_url="http://example")
+    # use a valid VulnerabilityType value; 'XSS' alone isn't defined
+    scan.vulnerabilities.append(make_vuln("Reflected XSS", "http://example/page"))
+    scan.vulnerabilities.append(make_vuln("Reflected XSS", "http://example/page"))
+
+    reporter = JSONReporter()
+    path = tmp_path / "out.json"
+    reporter.generate(scan, str(path))
+    data = json.loads(path.read_text())
+    # grouped findings should have an occurrence count of 2
+    grouped = data["scan"].get("grouped_findings", [])
+    assert grouped and grouped[0].get("occurrences") == 2

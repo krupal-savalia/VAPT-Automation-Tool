@@ -50,6 +50,20 @@ class JSONReporter:
             if vuln.get('evidence') and isinstance(vuln['evidence'], list):
                 entry['tested_payload'] = vuln['evidence'][0].get('payload_used')
             report_data['scan']['detailed_findings'].append(entry)
+
+        # group vulnerabilities to provide counts of similar findings
+        grouped: Dict[tuple, Dict] = {}
+        for vuln in report_data['scan']['vulnerabilities']:
+            key = (vuln.get('type'), vuln.get('target_url'))
+            if key not in grouped:
+                grouped[key] = {'count': 0, 'vulnerability': vuln}
+            grouped[key]['count'] += 1
+
+        report_data['scan']['grouped_findings'] = []
+        for (vtype, turl), info in grouped.items():
+            entry = info['vulnerability'].copy()
+            entry['occurrences'] = info['count']
+            report_data['scan']['grouped_findings'].append(entry)
         
         with open(output_file, 'w', encoding='utf-8') as f:
             json.dump(report_data, f, indent=2, ensure_ascii=False)
@@ -179,24 +193,33 @@ class HTMLReporter:
         if not scan_result.vulnerabilities:
             return "<p>No vulnerabilities found.</p>"
             
-        html = ""
+        # group by (type, url) so that duplicates can be collapsed and counted
+        grouped = {}
         for vuln in scan_result.vulnerabilities:
-            severity_lower = vuln.severity.value.lower()
-            # grab tested payload if available
+            key = (vuln.type.value, vuln.target_url)
+            grouped.setdefault(key, []).append(vuln)
+
+        html = ""
+        for (vtype, turl), group in grouped.items():
+            first = group[0]
+            count = len(group)
+            severity_lower = first.severity.value.lower()
             tested = None
-            if vuln.evidence:
-                tested = vuln.evidence[0].payload_used
-            priority = vuln.metadata.get('priority_score', None) if hasattr(vuln, 'metadata') else None
+            if first.evidence:
+                tested = first.evidence[0].payload_used
+            priority = first.metadata.get('priority_score', None) if hasattr(first, 'metadata') else None
+
             html += f"""
             <div class="vulnerability {severity_lower}">
-                <span class="badge {severity_lower}">{vuln.severity.value}</span>
-                <h3>{vuln.title}</h3>
-                <p><strong>URL:</strong> {vuln.target_url}</p>
+                <span class="badge {severity_lower}">{first.severity.value}</span>
+                <h3>{first.title}</h3>
+                <p><strong>URL:</strong> {first.target_url}</p>
+                {f'<p><em>{count} similar finding(s) collapsed</em></p>' if count > 1 else ''}
                 {f'<p><strong>Payload:</strong> {tested}</p>' if tested else ''}
                 {f'<p><strong>Priority Score:</strong> {priority}</p>' if priority is not None else ''}
-                <p><strong>Description:</strong> {vuln.description}</p>
-                <p><strong>CVSS Score:</strong> {vuln.cvss_score} | <strong>Confidence:</strong> {vuln.confidence:.1%}</p>
-                {f'<p><strong>Remediation:</strong> {vuln.remediation}</p>' if vuln.remediation else ''}
+                <p><strong>Description:</strong> {first.description}</p>
+                <p><strong>CVSS Score:</strong> {first.cvss_score} | <strong>Confidence:</strong> {first.confidence:.1%}</p>
+                {f'<p><strong>Remediation:</strong> {first.remediation}</p>' if first.remediation else ''}
             </div>
             """
         

@@ -23,6 +23,10 @@ from .detector.misconfiguration import (
     FileUploadDetector,
     CrossSiteRequestForgeryDetector,
 )
+# New detectors
+from .detector.xxe import XXEDetector
+from .detector.info_disclosure import InformationDisclosureDetector
+from .detector.ssrf import SSRFDetector
 from .risk_engine.cvss_engine import RiskEngine
 from .utils.models import ScanResult, Vulnerability
 from .utils.logging_util import setup_logging
@@ -121,10 +125,21 @@ class VulnerabilityScanner:
             # Access control detectors
             IDORDetector(),
             AuthenticationDetector(),
+            # New enhanced detectors
+            XXEDetector(),
+            InformationDisclosureDetector(),
+            SSRFDetector(),
         ]
         
         # Results
         self.scan_result = ScanResult(target_url=target_url)
+
+        # Track unique vulnerabilities to prevent duplicates
+        # Key: (vulnerability_type, url, parameter/injection_point)
+        self._found_vulnerabilities: Dict[tuple, bool] = {}
+        
+        # Track which URLs have already had security headers checked
+        self._security_headers_checked: set = set()
 
         # baseline responses for comparison during analysis
         self._baseline_responses: Dict[str, Dict] = {}
@@ -235,6 +250,7 @@ class VulnerabilityScanner:
                     'response_length': len(response.get('body', '')),
                     'injection_point': extra_evidence.get('injection_point'),
                     'payload_used': payload,
+                    'baseline_response': baseline,
                 }
                 # attach ai decision information if available
                 features = self.response_analyzer.analyze(response, baseline, payload)
@@ -242,16 +258,64 @@ class VulnerabilityScanner:
                 evidence['ai_decision'] = ai_decision
                 evidence['metadata'] = {'priority_score': ai_decision.get('priority_score', 0.0)}
 
+                # Determine canonical clean URL for security headers using baseline if available
+                from urllib.parse import urlparse
+                base_for_headers = baseline.get('url') if isinstance(baseline, dict) and baseline.get('url') else url
+                parsed_url = urlparse(base_for_headers)
+                clean_url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
+
+                # Determine if we should run security header detector for this URL (only once per unique URL)
+                run_security_headers = False
+                if clean_url not in self._security_headers_checked:
+                    self._security_headers_checked.add(clean_url)
+                    run_security_headers = True
+                    # Use baseline response headers for security header detection
+                    evidence['response_headers'] = baseline.get('headers', {})
+
                 # run detectors
                 for detector in self.detectors:
+                    # Skip SecurityHeaderDetector unless it's the first run for this URL
+                    if isinstance(detector, SecurityHeaderDetector) and not run_security_headers:
+                        continue
+                        
                     try:
                         findings = await detector.detect(url, evidence)
-                        # enrich each finding with priority if not already set
+                        
+                        # Deduplicate findings before adding
+                        unique_findings = []
                         for f in findings:
-                            if not f.metadata:
-                                f.metadata = {}
-                            f.metadata.setdefault('priority_score', ai_decision.get('priority_score', 0.0))
-                        self.scan_result.vulnerabilities.extend(findings)
+                            # Create unique key for this vulnerability. dataclass uses `type` and `target_url`.
+                            vuln_type = f.type.value if hasattr(f.type, 'value') else str(f.type)
+
+                            # For security headers and CORS, use only the base URL (without query params) for deduplication
+                            # This prevents duplicate reports for the same missing headers across different payloads/params
+                            if 'SECURITY' in vuln_type.upper() or 'CORS' in vuln_type.upper():
+                                # For header/CORS bugs, use the baseline URL if we have one, so that
+                                # variations from payloads or mutated paths do not produce new keys.
+                                base_key_url = baseline.get('url') if isinstance(baseline, dict) and baseline.get('url') else f.target_url
+                                parsed = urlparse(base_key_url)
+                                clean_vuln_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+                                vuln_key = (vuln_type, clean_vuln_url)
+                            else:
+                                # For other vulnerabilities, include the parameter/injection_point
+                                injection_point = extra_evidence.get('injection_point', '')
+                                vuln_key = (
+                                    vuln_type,
+                                    f.target_url,
+                                    # `affected_parameter` is used by the Vulnerability model
+                                    getattr(f, 'affected_parameter', None) or injection_point or 'unknown'
+                                )
+                            
+                            # Only add if not already found
+                            if vuln_key not in self._found_vulnerabilities:
+                                self._found_vulnerabilities[vuln_key] = True
+                                # enrich each finding with priority if not already set
+                                if not f.metadata:
+                                    f.metadata = {}
+                                f.metadata.setdefault('priority_score', ai_decision.get('priority_score', 0.0))
+                                unique_findings.append(f)
+                        
+                        self.scan_result.vulnerabilities.extend(unique_findings)
                     except Exception as e:
                         self.logger.debug(f"Detector {detector.name} failed during evaluation: {e}")
 
@@ -263,16 +327,49 @@ class VulnerabilityScanner:
                             # simple re-request with mutated payload using same params or body
                             if extra_evidence.get('request_method', 'GET') == 'POST':
                                 new_resp = await self.http_client.request(url, method="POST", data=extra_evidence.get('data'))
+                                full_url = url
                             else:
-                                new_resp = await self.http_client.request(url, params={extra_evidence.get('injection_point'): mp})
+                                # build parameter dict and compute full URL for mutated request
+                                param_name = extra_evidence.get('injection_point')
+                                new_params = {param_name: mp} if param_name else {}
+                                new_resp = await self.http_client.request(url, params=new_params)
+                                from urllib.parse import urlencode, urlparse
+                                parsed = urlparse(url)
+                                clean_base = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+                                full_url = clean_base + "?" + urlencode(new_params)
                             self.scan_result.total_payloads_sent += 1
                             # run detectors again but don't loop into AI again
                             new_evidence = evidence.copy()
                             new_evidence['payload_used'] = mp
+                            new_evidence['request_url'] = full_url
+                            # deduplicate mutated findings as well
                             for detector in self.detectors:
+                                # skip security headers on mutation runs (already checked above)
+                                if isinstance(detector, SecurityHeaderDetector):
+                                    continue
                                 try:
                                     findings = await detector.detect(url, new_evidence)
-                                    self.scan_result.vulnerabilities.extend(findings)
+                                    # perform same deduplication logic as above
+                                    for f in findings:
+                                        vuln_type = f.type.value if hasattr(f.type, 'value') else str(f.type)
+                                        if 'SECURITY' in vuln_type.upper() or 'CORS' in vuln_type.upper():
+                                            base_key_url = baseline.get('url') if isinstance(baseline, dict) and baseline.get('url') else f.target_url
+                                            parsed = urlparse(base_key_url)
+                                            clean_vuln_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+                                            vuln_key = (vuln_type, clean_vuln_url)
+                                        else:
+                                            injection_point = extra_evidence.get('injection_point', '')
+                                            vuln_key = (
+                                                vuln_type,
+                                                f.target_url,
+                                                getattr(f, 'affected_parameter', None) or injection_point or 'unknown'
+                                            )
+                                        if vuln_key not in self._found_vulnerabilities:
+                                            self._found_vulnerabilities[vuln_key] = True
+                                            if not f.metadata:
+                                                f.metadata = {}
+                                            f.metadata.setdefault('priority_score', ai_decision.get('priority_score', 0.0))
+                                            self.scan_result.vulnerabilities.append(f)
                                 except Exception:
                                     pass
                         except (asyncio.CancelledError, asyncio.TimeoutError):
@@ -301,7 +398,11 @@ class VulnerabilityScanner:
                                 self.scan_result.total_payloads_sent += 1
                                 if resp.get('error'):
                                     continue
-                                await _evaluate(url, baseline, payload, {'request_method': 'GET', 'injection_point': param_name}, resp)
+                                # build a full URL reflecting the injected payload so that
+                                # evidence.request_url accurately represents what was sent
+                                from urllib.parse import urlencode
+                                full_url = clean + "?" + urlencode(test_params, doseq=True)
+                                await _evaluate(full_url, baseline, payload, {'request_method': 'GET', 'injection_point': param_name}, resp)
                             except (asyncio.CancelledError, asyncio.TimeoutError):
                                 self.logger.debug(f"Timeout testing {param_name}")
                                 continue

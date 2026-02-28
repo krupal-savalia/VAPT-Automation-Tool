@@ -47,6 +47,7 @@ class VulnerabilityType(Enum):
     OPEN_REDIRECT = "Open Redirect"
     XXE = "XML External Entity"
     INFORMATION_DISCLOSURE = "Information Disclosure"
+    SSRF = "Server-Side Request Forgery"
 
 
 class Severity(Enum):

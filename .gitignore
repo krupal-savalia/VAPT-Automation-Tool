@@ -133,3 +133,6 @@ config.py
 config_examples.py
 validate_setup.py
 utils.py
+AI_PROMPT_FIX.md
+CSEH_ANALYSIS_REPORT.md
+TODO.md

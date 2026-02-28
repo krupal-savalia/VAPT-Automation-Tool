@@ -80,47 +80,41 @@ class XSSDetector(BaseDetector):
                 # Check if payload or parts of it appear in response
                 for marker_lower, marker_display in xss_markers:
                     if marker_lower in payload_lower and marker_lower in response_lower:
-                        findings.append(Vulnerability(
-                            vulnerability_type='Cross-Site Scripting (XSS)',
+                        findings.append(self.create_vulnerability(
+                            vuln_type=VulnerabilityType.REFLECTED_XSS,
+                            target_url=target_url,
                             title='Reflected XSS Vulnerability',
                             description=f'XSS payload executed: {marker_display}',
-                            severity='High',
+                            severity=Severity.HIGH,
                             confidence=0.90,
-                            url=target_url,
-                            parameter=injection_point,
-                            payload_used=payload_used,
-                            evidence=f'JavaScript payload {marker_display} found in response',
+                            evidence_data=evidence,
                         ))
                         return findings
                 
                 # Check for angle brackets and quotes that might escape context
                 if ('"><' in payload_used or '\'><' in payload_used) and ('"><' in response_body or '\'><' in response_body):
-                    findings.append(Vulnerability(
-                        vulnerability_type='Cross-Site Scripting (XSS)',
+                    findings.append(self.create_vulnerability(
+                        vuln_type=VulnerabilityType.REFLECTED_XSS,
+                        target_url=target_url,
                         title='Reflected XSS Vulnerability',
                         description='HTML context escape detected with XSS payload',
-                        severity='High',
+                        severity=Severity.HIGH,
                         confidence=0.85,
-                        url=target_url,
-                        parameter=injection_point,
-                        payload_used=payload_used,
-                        evidence='HTML escaping successful in response',
+                        evidence_data=evidence,
                     ))
                     return findings
                 
                 # Check for image/svg-based XSS
                 for img_marker in ['<img', '<svg']:
                     if img_marker in payload_lower and img_marker in response_lower:
-                        findings.append(Vulnerability(
-                            vulnerability_type='Cross-Site Scripting (XSS)',
+                        findings.append(self.create_vulnerability(
+                            vuln_type=VulnerabilityType.REFLECTED_XSS,
+                            target_url=target_url,
                             title='Image-Based XSS Vulnerability',
                             description=f'{img_marker} tag injection successful',
-                            severity='High',
+                            severity=Severity.HIGH,
                             confidence=0.85,
-                            url=target_url,
-                            parameter=injection_point,
-                            payload_used=payload_used,
-                            evidence=f'{img_marker} payload reflected in response',
+                            evidence_data=evidence,
                         ))
                         return findings
             
@@ -129,16 +123,14 @@ class XSSDetector(BaseDetector):
             for source in dom_sources:
                 if source in response_lower:
                     if any(unsafe in response_lower for unsafe in ['innerhtml', 'insertadjacenthtml', 'write(', 'writeln(']):
-                        findings.append(Vulnerability(
-                            vulnerability_type='Cross-Site Scripting (XSS)',
+                        findings.append(self.create_vulnerability(
+                            vuln_type=VulnerabilityType.REFLECTED_XSS,
+                            target_url=target_url,
                             title='DOM-Based XSS Detected',
                             description=f'Unsafe use of {source} with DOM manipulation',
-                            severity='High',
+                            severity=Severity.HIGH,
                             confidence=0.70,
-                            url=target_url,
-                            parameter='JavaScript context',
-                            payload_used=None,
-                            evidence='DOM XSS pattern detected in page source',
+                            evidence_data=evidence,
                         ))
                         break
                         
