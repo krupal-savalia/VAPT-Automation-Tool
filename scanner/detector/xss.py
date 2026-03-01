@@ -1,17 +1,39 @@
-"""XSS (Cross-Site Scripting) detection module."""
+"""XSS (Cross-Site Scripting) detection module.
+
+Refactored with:
+- HTML encoding verification (rejects encoded payloads)
+- CSP header checking
+- Execution context validation
+- Multi-payload confirmation (requires 2+ payloads)
+"""
 
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from .base import BaseDetector
-from ..utils.models import Vulnerability
+from ..utils.models import Vulnerability, Evidence
 from ..utils.constants import VulnerabilityType, Severity
+from ..utils.response_utils import (
+    normalize_response, 
+    hash_response,
+    validate_xss_reflection,
+    check_csp_protection,
+    XSS_EXECUTION_CONTEXTS,
+    XSS_SAFE_CONTEXTS
+)
 
 
 logger = logging.getLogger(__name__)
 
 
 class XSSDetector(BaseDetector):
-    """Detects Cross-Site Scripting vulnerabilities (Reflected, Stored, DOM)."""
+    """Detects Cross-Site Scripting vulnerabilities (Reflected, Stored, DOM).
+    
+    Enhanced with:
+    - Multi-payload confirmation (threshold=2)
+    - HTML encoding verification
+    - CSP header checking
+    - Execution context validation
+    """
     
     # Comprehensive XSS payloads with encoding variations
     REFLECTION_PAYLOADS = [
@@ -52,89 +74,134 @@ class XSSDetector(BaseDetector):
         Detect XSS vulnerabilities.
         
         Supports:
-        - Reflected XSS
+        - Reflected XSS (with validation)
         - Stored XSS
         - DOM-based XSS
+        
+        All detections require at least 2 independent payload confirmations.
         """
         findings = []
-        
         try:
             response_body = evidence.get('response_body', '')
             payload_used = str(evidence.get('payload_used', ''))
             injection_point = evidence.get('injection_point', 'unknown')
-            
-            response_lower = response_body.lower()
-            payload_lower = payload_used.lower()
-            
-            # Check for reflected XSS - payload appears unencoded in response
-            if payload_used and injection_point:
-                # Look for XSS payload markers in response
-                xss_markers = [
-                    ('script>', '<script'),
-                    ('onerror=', 'onerror='),
-                    ('onload=', 'onload='),
-                    ('onclick=', 'onclick='),
-                    ('alert(', 'alert('),
-                ]
-                
-                # Check if payload or parts of it appear in response
-                for marker_lower, marker_display in xss_markers:
-                    if marker_lower in payload_lower and marker_lower in response_lower:
-                        findings.append(self.create_vulnerability(
-                            vuln_type=VulnerabilityType.REFLECTED_XSS,
-                            target_url=target_url,
-                            title='Reflected XSS Vulnerability',
-                            description=f'XSS payload executed: {marker_display}',
-                            severity=Severity.HIGH,
-                            confidence=0.90,
-                            evidence_data=evidence,
-                        ))
-                        return findings
-                
-                # Check for angle brackets and quotes that might escape context
-                if ('"><' in payload_used or '\'><' in payload_used) and ('"><' in response_body or '\'><' in response_body):
-                    findings.append(self.create_vulnerability(
+            baseline = evidence.get('baseline_response', {}) or {}
+            content_type = evidence.get('response_headers', {}).get('Content-Type', '')
+            response_headers = evidence.get('response_headers', {})
+            baseline_snip = baseline.get('body_snippet', '')
+
+            if not payload_used or not injection_point:
+                return findings
+
+            # normalize for structural comparisons
+            normalized = normalize_response(response_body)
+            resp_hash = hash_response(response_body)
+            baseline_hash = baseline.get('hash', '')
+
+            # Add hash to evidence for confirmation tracking
+            evidence_with_hash = evidence.copy()
+            evidence_with_hash['response_hash'] = resp_hash
+
+            def confirm_and_report(desc: str, conf: float, detection_confidence: str = 'high') -> Optional[Vulnerability]:
+                key = f"xss::{target_url}::{injection_point}"
+                evidences = self._confirmation_engine.record(key, evidence_with_hash)
+                if evidences:
+                    vuln = self.create_vulnerability(
                         vuln_type=VulnerabilityType.REFLECTED_XSS,
                         target_url=target_url,
                         title='Reflected XSS Vulnerability',
-                        description='HTML context escape detected with XSS payload',
+                        description=desc,
                         severity=Severity.HIGH,
-                        confidence=0.85,
-                        evidence_data=evidence,
-                    ))
-                    return findings
-                
-                # Check for image/svg-based XSS
-                for img_marker in ['<img', '<svg']:
-                    if img_marker in payload_lower and img_marker in response_lower:
-                        findings.append(self.create_vulnerability(
-                            vuln_type=VulnerabilityType.REFLECTED_XSS,
-                            target_url=target_url,
-                            title='Image-Based XSS Vulnerability',
-                            description=f'{img_marker} tag injection successful',
-                            severity=Severity.HIGH,
-                            confidence=0.85,
-                            evidence_data=evidence,
-                        ))
-                        return findings
+                        confidence=conf,
+                        evidence_data=evidences[0],
+                        affected_parameter=injection_point,
+                        detection_confidence=detection_confidence
+                    )
+                    vuln.evidence = [Evidence(**{
+                        'request_url': e.get('request_url', target_url),
+                        'response_body': e.get('response_body', ''),
+                        'response_length': len(e.get('response_body', '')),
+                        'injection_point': e.get('injection_point'),
+                        'payload_used': e.get('payload_used'),
+                        'detection_method': self.name,
+                    }) for e in evidences]
+                    return vuln
+                return None
+
+            # Require HTML content type
+            if 'html' not in content_type.lower():
+                return findings
+
+            # Check if payload already in baseline
+            if baseline_snip and payload_used in baseline_snip:
+                return findings
+
+            # Use validation helper for XSS reflection
+            is_valid_xss, validation_reason = validate_xss_reflection(
+                response_body=response_body,
+                payload=payload_used,
+                content_type=content_type,
+                csp_headers=response_headers
+            )
             
-            # Check for DOM-based XSS indicators
-            dom_sources = ['location', 'window.name', 'document.referrer', 'document.url']
-            for source in dom_sources:
-                if source in response_lower:
-                    if any(unsafe in response_lower for unsafe in ['innerhtml', 'insertadjacenthtml', 'write(', 'writeln(']):
-                        findings.append(self.create_vulnerability(
-                            vuln_type=VulnerabilityType.REFLECTED_XSS,
-                            target_url=target_url,
-                            title='DOM-Based XSS Detected',
-                            description=f'Unsafe use of {source} with DOM manipulation',
-                            severity=Severity.HIGH,
-                            confidence=0.70,
-                            evidence_data=evidence,
-                        ))
-                        break
-                        
-        except Exception:
-            pass
+            if not is_valid_xss:
+                logger.debug(f"XSS validation failed: {validation_reason}")
+                return findings
+
+            # Check CSP protection
+            is_csp_protected, csp_details = check_csp_protection(response_headers)
+            
+            if is_csp_protected and 'unsafe-inline' not in csp_details.lower():
+                logger.debug(f"XSS blocked by CSP: {csp_details}")
+                return findings
+
+            # Check for execution context (high confidence)
+            normalized_lower = normalized.lower()
+            has_execution_ctx = any(ctx in normalized_lower for ctx in XSS_EXECUTION_CONTEXTS)
+            
+            if has_execution_ctx:
+                v = confirm_and_report(
+                    f'Payload reflected in executable context: {validation_reason}',
+                    0.85,
+                    'high'
+                )
+                if v:
+                    findings.append(v)
+                    return findings
+
+            # Check for safe contexts (reject if in safe context)
+            for safe_ctx in XSS_SAFE_CONTEXTS:
+                if safe_ctx in normalized_lower:
+                    logger.debug(f"XSS in safe context: {safe_ctx}")
+                    return findings
+
+            # If no execution context but reflected (medium confidence)
+            if payload_used and payload_used in normalized:
+                v = confirm_and_report(
+                    f'Payload reflected but no clear execution context: {validation_reason}',
+                    0.60,
+                    'medium'
+                )
+                if v:
+                    findings.append(v)
+                    return findings
+
+            # DOM-based XSS detection
+            dom_sources_lower = [s.lower() for s in self.DOM_SOURCES]
+            for source in dom_sources_lower:
+                if source in response_body.lower():
+                    unsafe_patterns = ['innerhtml', 'insertadjacenthtml', 'write(', 'writeln(']
+                    if any(unsafe in response_body.lower() for unsafe in unsafe_patterns):
+                        v = confirm_and_report(
+                            f'Unsafe DOM usage of {source}',
+                            0.70,
+                            'medium'
+                        )
+                        if v:
+                            findings.append(v)
+                            return findings
+                            
+        except Exception as e:
+            logger.debug(f"XSS detection error: {e}")
             
         return findings

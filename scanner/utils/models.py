@@ -41,6 +41,8 @@ class Vulnerability:
     # Assessment
     severity: Severity
     confidence: float  # 0.0 - 1.0
+    # additional confidence descriptor assigned by detectors (high/medium/low)
+    detection_confidence: str = ''
     exploitability: float = 0.5  # 0.0 - 1.0
     reachability: float = 1.0  # 0.0 - 1.0
     
@@ -69,6 +71,7 @@ class Vulnerability:
         data['severity'] = self.severity.value
         data['discovered_at'] = self.discovered_at.isoformat()
         data['evidence'] = [e.to_dict() for e in self.evidence]
+        # detection_confidence is already included via asdict
         return data
 
 

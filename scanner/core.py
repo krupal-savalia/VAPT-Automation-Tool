@@ -4,7 +4,7 @@ import asyncio
 import logging
 from typing import List, Optional, Dict, Any
 from datetime import datetime
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, parse_qs, urlencode
 
 from .crawler.advanced_crawler import AdvancedCrawler
 from .detector.injection import SQLInjectionDetector, NoSQLInjectionDetector
@@ -14,6 +14,7 @@ from .detector.security_config import (
     CORSDetector,
     DirectoryIndexingDetector,
 )
+from .detector.lfi import LFIDetector, DirectoryTraversalDetector, get_all_lfi_payloads
 from .detector.command_injection import CommandInjectionDetector
 from .detector.ssti import SSTIDetector
 from .detector.access_control import IDORDetector, AuthenticationDetector
@@ -37,6 +38,7 @@ from .payload_database import get_payloads
 from .response_analyzer import ResponseAnalyzer
 from .ai_selector import AISelector
 from .mutation_engine import MutationEngine
+from .utils.response_utils import hash_response
 
 
 logger = logging.getLogger(__name__)
@@ -112,6 +114,9 @@ class VulnerabilityScanner:
             NoSQLInjectionDetector(),
             CommandInjectionDetector(),
             SSTIDetector(),
+            # LFI and Path Traversal detector
+            LFIDetector(),
+            DirectoryTraversalDetector(),
             # XSS detector
             XSSDetector(),
             # Security configuration detectors
@@ -148,6 +153,15 @@ class VulnerabilityScanner:
         self.response_analyzer = ResponseAnalyzer()
         self.ai_selector = AISelector()
         self.mutation_engine = MutationEngine()
+        
+        # simple per-host rate limiter helper
+        import random
+        async def _limited_request(url, **kwargs):
+            resp = await self.http_client.request(url, **kwargs)
+            self.scan_result.total_payloads_sent += 1
+            await asyncio.sleep(random.uniform(0.2, 0.5))
+            return resp
+        self._limited_request = _limited_request
         
     async def scan(self) -> ScanResult:
         """
@@ -208,18 +222,14 @@ class VulnerabilityScanner:
             self.logger.error(f"Crawling failed: {e}", exc_info=True)
             
     async def _detect_vulnerabilities(self):
-        """Test discovered URLs and forms for vulnerabilities.
-
-        The method has been significantly enhanced to make use of the
-        payload database, response analysis and AI-assisted mutation.  It
-        still preserves the original detectors for backwards compatibility.
-        """
+        """Test discovered URLs and forms for vulnerabilities."""
         try:
             urls_to_test = self.scan_result.discovered_urls
             self.logger.info(f"Testing {len(urls_to_test)} URLs")
 
-            # fetch a baseline response for each unique clean URL (no query params)
-            from urllib.parse import urlparse
+            # capture detailed baseline for each unique endpoint
+            from scanner.utils.response_utils import capture_baseline
+            import random
 
             for url in urls_to_test:
                 clean = url.split('?', 1)[0]
@@ -227,31 +237,47 @@ class VulnerabilityScanner:
                     try:
                         resp = await self.http_client.request(clean)
                         self.scan_result.total_payloads_sent += 1
-                        self._baseline_responses[clean] = resp
-                    except asyncio.CancelledError:
-                        self.logger.warning(f"Baseline request cancelled for {clean}")
-                        self._baseline_responses[clean] = {}
-                    except asyncio.TimeoutError:
-                        self.logger.warning(f"Baseline request timeout for {clean}")
-                        self._baseline_responses[clean] = {}
+                        baseline_record = capture_baseline(resp)
+                        self._baseline_responses[clean] = baseline_record
+                        self.logger.debug(f"Baseline captured for {clean}: status={resp.get('status')}, hash={baseline_record.get('hash', '')[:16]}...")
                     except Exception as e:
                         self.logger.debug(f"Failed to fetch baseline for {clean}: {e}")
                         self._baseline_responses[clean] = {}
+                    # simple rate-limiting: small random delay between requests
+                    await asyncio.sleep(random.uniform(0.2, 0.5))
 
             # helper closure to process any response, run detectors and AI
             async def _evaluate(url: str, baseline: Dict, payload: str, extra_evidence: Dict[str, Any], response: Dict[str, Any]):
+                # Get hashes for debugging
+                baseline_hash = baseline.get('hash', '') if baseline else ''
+                response_body = response.get('body', '')
+                response_hash = hash_response(response_body) if response_body else ''
+                
+                # Debug logging for injection testing
+                self.logger.debug(f"[INJECTION] URL: {url}")
+                self.logger.debug(f"[INJECTION] Method: {extra_evidence.get('request_method', 'GET')}")
+                self.logger.debug(f"[INJECTION] Payload: {payload}")
+                self.logger.debug(f"[INJECTION] Injection Point: {extra_evidence.get('injection_point', 'unknown')}")
+                self.logger.debug(f"[INJECTION] Baseline Hash: {baseline_hash[:16] if baseline_hash else 'None'}...")
+                self.logger.debug(f"[INJECTION] Response Hash: {response_hash[:16] if response_hash else 'None'}...")
+                self.logger.debug(f"[INJECTION] Response Status: {response.get('status', 0)}")
+                self.logger.debug(f"[INJECTION] Response Different: {baseline_hash != response_hash if baseline_hash and response_hash else 'N/A'}")
+                
                 # build full evidence
                 evidence = {
                     'request_url': url,
                     'request_method': extra_evidence.get('request_method', 'GET'),
                     'response_status': response.get('status', 0),
                     'response_headers': response.get('headers', {}),
-                    'response_body': response.get('body', ''),
-                    'response_length': len(response.get('body', '')),
+                    'response_body': response_body,
+                    'response_length': len(response_body),
                     'injection_point': extra_evidence.get('injection_point'),
                     'payload_used': payload,
                     'baseline_response': baseline,
+                    'response_hash': response_hash,
+                    'baseline_hash': baseline_hash,
                 }
+                
                 # attach ai decision information if available
                 features = self.response_analyzer.analyze(response, baseline, payload)
                 ai_decision = self.ai_selector.select(features)
@@ -259,7 +285,6 @@ class VulnerabilityScanner:
                 evidence['metadata'] = {'priority_score': ai_decision.get('priority_score', 0.0)}
 
                 # Determine canonical clean URL for security headers using baseline if available
-                from urllib.parse import urlparse
                 base_for_headers = baseline.get('url') if isinstance(baseline, dict) and baseline.get('url') else url
                 parsed_url = urlparse(base_for_headers)
                 clean_url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
@@ -281,17 +306,18 @@ class VulnerabilityScanner:
                     try:
                         findings = await detector.detect(url, evidence)
                         
+                        # Log if any findings detected
+                        if findings:
+                            self.logger.info(f"[DETECTOR {detector.name}] Found {len(findings)} vulnerabilities for {url} with payload: {payload[:50]}...")
+                        
                         # Deduplicate findings before adding
                         unique_findings = []
                         for f in findings:
-                            # Create unique key for this vulnerability. dataclass uses `type` and `target_url`.
+                            # Create unique key for this vulnerability
                             vuln_type = f.type.value if hasattr(f.type, 'value') else str(f.type)
 
-                            # For security headers and CORS, use only the base URL (without query params) for deduplication
-                            # This prevents duplicate reports for the same missing headers across different payloads/params
+                            # For security headers and CORS, use only the base URL for deduplication
                             if 'SECURITY' in vuln_type.upper() or 'CORS' in vuln_type.upper():
-                                # For header/CORS bugs, use the baseline URL if we have one, so that
-                                # variations from payloads or mutated paths do not produce new keys.
                                 base_key_url = baseline.get('url') if isinstance(baseline, dict) and baseline.get('url') else f.target_url
                                 parsed = urlparse(base_key_url)
                                 clean_vuln_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
@@ -302,14 +328,12 @@ class VulnerabilityScanner:
                                 vuln_key = (
                                     vuln_type,
                                     f.target_url,
-                                    # `affected_parameter` is used by the Vulnerability model
                                     getattr(f, 'affected_parameter', None) or injection_point or 'unknown'
                                 )
                             
                             # Only add if not already found
                             if vuln_key not in self._found_vulnerabilities:
                                 self._found_vulnerabilities[vuln_key] = True
-                                # enrich each finding with priority if not already set
                                 if not f.metadata:
                                     f.metadata = {}
                                 f.metadata.setdefault('priority_score', ai_decision.get('priority_score', 0.0))
@@ -324,32 +348,25 @@ class VulnerabilityScanner:
                     mutated = self.mutation_engine.mutate(payload, ai_decision['mutation_strategies'])
                     for mp in mutated:
                         try:
-                            # simple re-request with mutated payload using same params or body
                             if extra_evidence.get('request_method', 'GET') == 'POST':
-                                new_resp = await self.http_client.request(url, method="POST", data=extra_evidence.get('data'))
+                                new_resp = await self._limited_request(url, method="POST", data=extra_evidence.get('data'))
                                 full_url = url
                             else:
-                                # build parameter dict and compute full URL for mutated request
                                 param_name = extra_evidence.get('injection_point')
                                 new_params = {param_name: mp} if param_name else {}
-                                new_resp = await self.http_client.request(url, params=new_params)
-                                from urllib.parse import urlencode, urlparse
+                                new_resp = self._limited_request(url, params=new_params)
                                 parsed = urlparse(url)
                                 clean_base = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
                                 full_url = clean_base + "?" + urlencode(new_params)
                             self.scan_result.total_payloads_sent += 1
-                            # run detectors again but don't loop into AI again
                             new_evidence = evidence.copy()
                             new_evidence['payload_used'] = mp
                             new_evidence['request_url'] = full_url
-                            # deduplicate mutated findings as well
                             for detector in self.detectors:
-                                # skip security headers on mutation runs (already checked above)
                                 if isinstance(detector, SecurityHeaderDetector):
                                     continue
                                 try:
                                     findings = await detector.detect(url, new_evidence)
-                                    # perform same deduplication logic as above
                                     for f in findings:
                                         vuln_type = f.type.value if hasattr(f.type, 'value') else str(f.type)
                                         if 'SECURITY' in vuln_type.upper() or 'CORS' in vuln_type.upper():
@@ -372,74 +389,164 @@ class VulnerabilityScanner:
                                             self.scan_result.vulnerabilities.append(f)
                                 except Exception:
                                     pass
-                        except (asyncio.CancelledError, asyncio.TimeoutError):
-                            self.logger.debug(f"Timeout on mutated payload")
-                            continue
                         except Exception:
                             pass
 
             # iterate over each discovered URL for baseline tests plus checks
-            from urllib.parse import urlparse, parse_qs
-
             for url in urls_to_test:
                 parsed = urlparse(url)
                 clean = parsed.scheme + "://" + parsed.netloc + parsed.path
-                baseline = self._baseline_responses.get(clean, {})
+                
+                # IMPORTANT: Capture baseline from the ORIGINAL URL (with parameters)
+                # not the clean URL, so comparison is meaningful
+                if url not in self._baseline_responses:
+                    try:
+                        resp = await self.http_client.request(url)
+                        self.scan_result.total_payloads_sent += 1
+                        baseline_record = capture_baseline(resp)
+                        self._baseline_responses[url] = baseline_record
+                        self.logger.debug(f"[BASELINE] Original URL baseline: {url}")
+                        self.logger.debug(f"[BASELINE] Status: {resp.get('status')}, Hash: {baseline_record.get('hash', '')[:16]}...")
+                    except Exception as e:
+                        self.logger.debug(f"Failed to fetch baseline for {url}: {e}")
+                        self._baseline_responses[url] = {}
+                    await asyncio.sleep(0.2)
+                
+                baseline = self._baseline_responses.get(url, {})
 
                 # check query parameters if present
                 params = parse_qs(parsed.query)
                 if params:
+                    self.logger.debug(f"[PARAM_EXTRACT] URL: {url}")
+                    self.logger.debug(f"[PARAM_EXTRACT] Parameters found: {list(params.keys())}")
+                    
                     for param_name, values in params.items():
-                        payloads = get_payloads('sqli_error') + get_payloads('sqli_boolean') + self.xss_payloads
-                        for payload in payloads:
-                            test_params = {k: (payload if k == param_name else v[0]) for k, v in params.items()}
+                        original_value = values[0] if values else ''
+                        self.logger.debug(f"[PARAM_INJECT] Target param: {param_name}, Original value: {original_value}")
+                        
+                        # Get both true and false boolean payloads for proper testing
+                        error_payloads = get_payloads('sqli_error')
+                        boolean_true_payloads = get_payloads('sqli_boolean_true')
+                        boolean_false_payloads = get_payloads('sqli_boolean_false')
+                        xss_payloads = self.xss_payloads
+                        lfi_payloads = get_payloads('lfi')
+                        
+                        all_payloads = error_payloads + xss_payloads + lfi_payloads
+                        
+                        for payload in all_payloads:
+                            # Build test parameters - ONLY replace target param, preserve others
+                            test_params = {}
+                            for k, v in params.items():
+                                if k == param_name:
+                                    test_params[k] = payload
+                                else:
+                                    test_params[k] = v[0] if v else ''
+                            
+                            # Reconstruct URL with mutated parameters
+                            from urllib.parse import urlencode as urllib_urlencode
+                            query_string = urllib_urlencode(test_params, doseq=True)
+                            full_url = f"{clean}?{query_string}"
+                            
+                            self.logger.debug(f"[PARAM_MUTATE] Original: {url}")
+                            self.logger.debug(f"[PARAM_MUTATE] Mutated:  {full_url}")
+                            self.logger.debug(f"[PARAM_MUTATE] Payload: {payload[:50]}...")
+                            
                             try:
-                                resp = await self.http_client.request(clean, method="GET", params=test_params)
-                                self.scan_result.total_payloads_sent += 1
+                                resp = await self._limited_request(clean, method="GET", params=test_params)
                                 if resp.get('error'):
+                                    self.logger.debug(f"[PARAM_TEST] Error fetching: {resp.get('error')}")
                                     continue
-                                # build a full URL reflecting the injected payload so that
-                                # evidence.request_url accurately represents what was sent
-                                from urllib.parse import urlencode
-                                full_url = clean + "?" + urlencode(test_params, doseq=True)
+                                    
+                                resp_hash = hash_response(resp.get('body', ''))
+                                baseline_hash = baseline.get('hash', '')
+                                
+                                self.logger.debug(f"[PARAM_COMPARE] Baseline hash: {baseline_hash[:16] if baseline_hash else 'None'}...")
+                                self.logger.debug(f"[PARAM_COMPARE] Response hash:  {resp_hash[:16] if resp_hash else 'None'}...")
+                                self.logger.debug(f"[PARAM_COMPARE] Hashes differ: {baseline_hash != resp_hash if baseline_hash and resp_hash else 'N/A'}")
+                                
                                 await _evaluate(full_url, baseline, payload, {'request_method': 'GET', 'injection_point': param_name}, resp)
-                            except (asyncio.CancelledError, asyncio.TimeoutError):
-                                self.logger.debug(f"Timeout testing {param_name}")
-                                continue
-                            except Exception:
+                            except Exception as e:
+                                self.logger.debug(f"[PARAM_TEST] Exception: {e}")
+                                pass
+                        
+                        # Boolean-based testing: send true/false pairs together
+                        self.logger.debug(f"[BOOLEAN_TEST] Testing boolean pairs for {param_name}")
+                        for true_payload, false_payload in zip(boolean_true_payloads, boolean_false_payloads):
+                            try:
+                                # Test TRUE payload
+                                test_params_true = {}
+                                for k, v in params.items():
+                                    if k == param_name:
+                                        test_params_true[k] = true_payload
+                                    else:
+                                        test_params_true[k] = v[0] if v else ''
+                                
+                                from urllib.parse import urlencode as urllib_urlencode
+                                query_true = urllib_urlencode(test_params_true, doseq=True)
+                                full_url_true = f"{clean}?{query_true}"
+                                
+                                resp_true = await self._limited_request(clean, method="GET", params=test_params_true)
+                                resp_true_hash = hash_response(resp_true.get('body', ''))
+                                
+                                self.logger.debug(f"[BOOLEAN] TRUE Payload: {true_payload[:50]}...")
+                                self.logger.debug(f"[BOOLEAN] TRUE Response Hash: {resp_true_hash[:16] if resp_true_hash else 'None'}...")
+                                
+                                if not resp_true.get('error'):
+                                    await _evaluate(full_url_true, baseline, true_payload, {'request_method': 'GET', 'injection_point': param_name, 'boolean_pair': 'true'}, resp_true)
+                                
+                                # Test FALSE payload
+                                test_params_false = {}
+                                for k, v in params.items():
+                                    if k == param_name:
+                                        test_params_false[k] = false_payload
+                                    else:
+                                        test_params_false[k] = v[0] if v else ''
+                                
+                                query_false = urllib_urlencode(test_params_false, doseq=True)
+                                full_url_false = f"{clean}?{query_false}"
+                                
+                                resp_false = await self._limited_request(clean, method="GET", params=test_params_false)
+                                resp_false_hash = hash_response(resp_false.get('body', ''))
+                                
+                                self.logger.debug(f"[BOOLEAN] FALSE Payload: {false_payload[:50]}...")
+                                self.logger.debug(f"[BOOLEAN] FALSE Response Hash: {resp_false_hash[:16] if resp_false_hash else 'None'}...")
+                                
+                                if not resp_false.get('error'):
+                                    await _evaluate(full_url_false, baseline, false_payload, {'request_method': 'GET', 'injection_point': param_name, 'boolean_pair': 'false'}, resp_false)
+                                
+                                # Log response difference for boolean pair
+                                if resp_true_hash and resp_false_hash:
+                                    self.logger.debug(f"[BOOLEAN] TRUE != FALSE: {resp_true_hash != resp_false_hash}")
+                                    
+                            except Exception as e:
+                                self.logger.debug(f"[BOOLEAN_TEST] Exception: {e}")
                                 pass
 
                 # directory traversal probes
+                # Ensure proper URL joining - add trailing slash if not present
+                base_for_traversal = clean if clean.endswith('/') else clean + '/'
                 for payload in get_payloads('dir_traversal'):
-                    target = clean + payload
+                    target = base_for_traversal + payload
                     try:
-                        resp = await self.http_client.request(target)
-                        self.scan_result.total_payloads_sent += 1
+                        resp = await self._limited_request(target)
                         if not resp.get('error'):
                             await _evaluate(target, baseline, payload, {'request_method': 'GET'}, resp)
-                    except (asyncio.CancelledError, asyncio.TimeoutError):
-                        self.logger.debug(f"Timeout on {target}")
-                        continue
                     except Exception:
                         pass
 
                 # open redirect probes (append as ?next=... or similar)
                 for payload in get_payloads('open_redirect'):
                     try:
-                        resp = await self.http_client.request(clean, method="GET", params={'next': payload})
-                        self.scan_result.total_payloads_sent += 1
+                        resp = await self._limited_request(clean, method="GET", params={'next': payload})
                         if not resp.get('error'):
                             await _evaluate(url, baseline, payload, {'request_method': 'GET', 'injection_point': 'next'}, resp)
-                    except (asyncio.CancelledError, asyncio.TimeoutError):
-                        self.logger.debug(f"Timeout on redirect probe")
-                        continue
                     except Exception:
                         pass
 
                 # unsafe HTTP methods
                 for method in get_payloads('http_methods'):
                     try:
-                        resp = await self.http_client.request(clean, method=method)
+                        resp = await self._limited_request(clean, method=method)
                         self.scan_result.total_payloads_sent += 1
                         if resp.get('status', 0) not in (405, 501):
                             evidence = {
@@ -448,40 +555,147 @@ class VulnerabilityScanner:
                                 'response_status': resp.get('status', 0),
                                 'response_body': resp.get('body', ''),
                             }
-                            # record as potential misconfiguration
                             for detector in self.detectors:
                                 if isinstance(detector, HTTPMethodDetector):
                                     findings = await detector.detect(clean, evidence)
                                     self.scan_result.vulnerabilities.extend(findings)
-                    except (asyncio.CancelledError, asyncio.TimeoutError):
-                        self.logger.debug(f"Timeout testing {method}")
-                        continue
                     except Exception:
                         pass
 
-            # forms submission (previous behaviour, but using payload database)
+            # forms submission
             forms_to_test = self.crawler.discovered_forms
             self.logger.info(f"Testing {len(forms_to_test)} forms with injection payloads")
 
             for form in forms_to_test:
                 form_url = urljoin(form.url, form.action) if form.action else form.url
+                
+                # Get baseline for form URL
+                if form_url not in self._baseline_responses:
+                    try:
+                        resp = await self.http_client.request(form_url)
+                        self.scan_result.total_payloads_sent += 1
+                        baseline_record = capture_baseline(resp)
+                        self._baseline_responses[form_url] = baseline_record
+                        self.logger.debug(f"[FORM_BASELINE] URL: {form_url}")
+                        self.logger.debug(f"[FORM_BASELINE] Status: {resp.get('status')}, Hash: {baseline_record.get('hash', '')[:16]}...")
+                    except Exception as e:
+                        self.logger.debug(f"Failed to fetch baseline for form {form_url}: {e}")
+                        self._baseline_responses[form_url] = {}
+                    await asyncio.sleep(0.2)
+                
+                form_baseline = self._baseline_responses.get(form_url, {})
+                
+                # Extract field names and default values
+                field_names = [f['name'] for f in form.fields]
+                field_defaults = {f['name']: f.get('value', '') for f in form.fields}
+                
+                self.logger.debug(f"[FORM_EXTRACT] Form URL: {form_url}")
+                self.logger.debug(f"[FORM_EXTRACT] Method: {form.method.upper()}")
+                self.logger.debug(f"[FORM_EXTRACT] Fields: {field_names}")
+                
                 for field in form.fields:
-                    payloads = get_payloads('sqli_error') + self.xss_payloads
-                    for payload in payloads:
+                    field_name = field['name']
+                    self.logger.debug(f"[FORM_TARGET] Testing field: {field_name}")
+                    
+                    # Get payloads for injection
+                    error_payloads = get_payloads('sqli_error')
+                    boolean_true_payloads = get_payloads('sqli_boolean_true')
+                    boolean_false_payloads = get_payloads('sqli_boolean_false')
+                    xss_payloads = self.xss_payloads
+                    
+                    all_payloads = error_payloads + xss_payloads
+                    
+                    for payload in all_payloads:
                         try:
-                            form_data = {f['name']: payload for f in form.fields}
+                            # Build form data: ONLY replace target field, PRESERVE other field values/defaults
+                            form_data = {}
+                            for f in form.fields:
+                                if f['name'] == field_name:
+                                    form_data[f['name']] = payload
+                                else:
+                                    # Use the field's default value, or empty string
+                                    form_data[f['name']] = f.get('value', '')
+                            
+                            self.logger.debug(f"[FORM_MUTATE] Target field: {field_name}")
+                            self.logger.debug(f"[FORM_MUTATE] Payload: {payload[:50]}...")
+                            self.logger.debug(f"[FORM_MUTATE] Form data keys: {list(form_data.keys())}")
+                            self.logger.debug(f"[FORM_MUTATE] Injected field value: {form_data[field_name][:50]}...")
+                            
                             if form.method.upper() == "POST":
-                                resp = await self.http_client.request(form_url, method="POST", data=form_data)
+                                resp = await self._limited_request(form_url, method="POST", data=form_data)
                             else:
-                                resp = await self.http_client.request(form_url, method="GET", params=form_data)
+                                resp = await self._limited_request(form_url, method="GET", params=form_data)
+                            
                             self.scan_result.total_payloads_sent += 1
+                            
                             if resp.get('error'):
+                                self.logger.debug(f"[FORM_TEST] Error: {resp.get('error')}")
                                 continue
-                            await _evaluate(form_url, baseline, payload, {'request_method': form.method.upper(), 'injection_point': field['name'], 'data': form_data}, resp)
-                        except (asyncio.CancelledError, asyncio.TimeoutError):
-                            self.logger.debug(f"Timeout on form {form_url}")
-                            continue
-                        except Exception:
+                            
+                            resp_hash = hash_response(resp.get('body', ''))
+                            baseline_hash = form_baseline.get('hash', '')
+                            
+                            self.logger.debug(f"[FORM_COMPARE] Baseline hash: {baseline_hash[:16] if baseline_hash else 'None'}...")
+                            self.logger.debug(f"[FORM_COMPARE] Response hash:  {resp_hash[:16] if resp_hash else 'None'}...")
+                            self.logger.debug(f"[FORM_COMPARE] Hashes differ: {baseline_hash != resp_hash if baseline_hash and resp_hash else 'N/A'}")
+                            
+                            await _evaluate(form_url, form_baseline, payload, {'request_method': form.method.upper(), 'injection_point': field_name, 'data': form_data}, resp)
+                        except Exception as e:
+                            self.logger.debug(f"[FORM_TEST] Exception: {e}")
+                            pass
+                    
+                    # Boolean-based testing for form fields
+                    self.logger.debug(f"[FORM_BOOLEAN] Testing boolean pairs for {field_name}")
+                    for true_payload, false_payload in zip(boolean_true_payloads, boolean_false_payloads):
+                        try:
+                            # Test TRUE payload
+                            form_data_true = {}
+                            for f in form.fields:
+                                if f['name'] == field_name:
+                                    form_data_true[f['name']] = true_payload
+                                else:
+                                    form_data_true[f['name']] = f.get('value', '')
+                            
+                            self.logger.debug(f"[FORM_BOOLEAN] TRUE Payload: {true_payload[:50]}...")
+                            
+                            if form.method.upper() == "POST":
+                                resp_true = await self._limited_request(form_url, method="POST", data=form_data_true)
+                            else:
+                                resp_true = await self._limited_request(form_url, method="GET", params=form_data_true)
+                            
+                            resp_true_hash = hash_response(resp_true.get('body', ''))
+                            self.logger.debug(f"[FORM_BOOLEAN] TRUE Response Hash: {resp_true_hash[:16] if resp_true_hash else 'None'}...")
+                            
+                            if not resp_true.get('error'):
+                                await _evaluate(form_url, form_baseline, true_payload, {'request_method': form.method.upper(), 'injection_point': field_name, 'data': form_data_true, 'boolean_pair': 'true'}, resp_true)
+                            
+                            # Test FALSE payload
+                            form_data_false = {}
+                            for f in form.fields:
+                                if f['name'] == field_name:
+                                    form_data_false[f['name']] = false_payload
+                                else:
+                                    form_data_false[f['name']] = f.get('value', '')
+                            
+                            self.logger.debug(f"[FORM_BOOLEAN] FALSE Payload: {false_payload[:50]}...")
+                            
+                            if form.method.upper() == "POST":
+                                resp_false = await self._limited_request(form_url, method="POST", data=form_data_false)
+                            else:
+                                resp_false = await self._limited_request(form_url, method="GET", params=form_data_false)
+                            
+                            resp_false_hash = hash_response(resp_false.get('body', ''))
+                            self.logger.debug(f"[FORM_BOOLEAN] FALSE Response Hash: {resp_false_hash[:16] if resp_false_hash else 'None'}...")
+                            
+                            if not resp_false.get('error'):
+                                await _evaluate(form_url, form_baseline, false_payload, {'request_method': form.method.upper(), 'injection_point': field_name, 'data': form_data_false, 'boolean_pair': 'false'}, resp_false)
+                            
+                            # Log response difference for boolean pair
+                            if resp_true_hash and resp_false_hash:
+                                self.logger.debug(f"[FORM_BOOLEAN] TRUE != FALSE: {resp_true_hash != resp_false_hash}")
+                                
+                        except Exception as e:
+                            self.logger.debug(f"[FORM_BOOLEAN] Exception: {e}")
                             pass
 
         except Exception as e:

@@ -48,6 +48,8 @@ class VulnerabilityType(Enum):
     XXE = "XML External Entity"
     INFORMATION_DISCLOSURE = "Information Disclosure"
     SSRF = "Server-Side Request Forgery"
+    PATH_TRAVERSAL = "Path Traversal"
+    LOCAL_FILE_INCLUSION = "Local File Inclusion"
 
 
 class Severity(Enum):

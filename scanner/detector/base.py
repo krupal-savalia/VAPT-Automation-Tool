@@ -1,9 +1,121 @@
-"""Base detector class and detection utilities."""
+"""Base detector class and detection utilities.
+
+Includes a lightweight confirmation engine and normalization helpers used
+by multiple detectors to avoid reporting on a single payload failure.
+"""
 
 from abc import ABC, abstractmethod
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set, Tuple
 import logging
 from ..utils.models import Vulnerability, Evidence
+
+
+class ConfirmationEngine:
+    """Track payload confirmations for a candidate vulnerability.
+
+    Stores unique payloads that produced positive detection for a given key.
+    When the number of distinct payloads meets or exceeds the configured
+    threshold the engine returns the accumulated evidences so a real
+    vulnerability object can be emitted.
+    
+    Enhanced to support:
+    - Multi-payload confirmation (threshold-based)
+    - Boolean-based SQLi pair tracking (true/false pairs)
+    - Different vulnerability type confirmation rules
+    """
+
+    def __init__(self, threshold: int = 1):
+        self.threshold = threshold
+        self._store: Dict[str, Dict[str, Any]] = {}
+        # Boolean pair tracking: key -> {'true_payloads': [], 'false_payloads': [], 'pairs_confirmed': 0}
+        self._boolean_pairs: Dict[str, Dict[str, Any]] = {}
+
+    def record(self, key: str, evidence: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+        """Record a payload confirmation. Returns evidences if threshold met."""
+        entry = self._store.setdefault(key, {'payloads': set(), 'evidences': []})
+        payload = evidence.get('payload_used')
+        if payload and payload not in entry['payloads']:
+            entry['payloads'].add(payload)
+            entry['evidences'].append(evidence.copy())
+        if len(entry['payloads']) >= self.threshold:
+            # once threshold met, return copy of evidences and clear store to
+            # prevent duplicate reporting later
+            evidences = entry['evidences'][:]
+            del self._store[key]
+            return evidences
+        return None
+
+    def record_boolean_pair(
+        self, 
+        key: str, 
+        true_evidence: Dict[str, Any], 
+        false_evidence: Dict[str, Any]
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Record a boolean-based SQL injection true/false pair.
+        
+        Only reports if:
+        - True response differs from False response
+        - True response is similar to baseline
+        - This pattern is confirmed at least twice
+        
+        Returns evidences if pair confirmation threshold met.
+        """
+        entry = self._boolean_pairs.setdefault(key, {
+            'true_payloads': [], 
+            'false_payloads': [], 
+            'true_evidences': [],
+            'false_evidences': [],
+            'pairs_confirmed': 0
+        })
+        
+        true_payload = true_evidence.get('payload_used', '')
+        false_payload = false_evidence.get('payload_used', '')
+        
+        # Check if this exact pair already recorded
+        if true_payload in entry['true_payloads'] and false_payload in entry['false_payloads']:
+            return None
+            
+        entry['true_payloads'].append(true_payload)
+        entry['false_payloads'].append(false_payload)
+        entry['true_evidences'].append(true_evidence.copy())
+        entry['false_evidences'].append(false_evidence.copy())
+        
+        # Calculate response differences
+        true_hash = true_evidence.get('response_hash', '')
+        false_hash = false_evidence.get('response_hash', '')
+        baseline_hash = true_evidence.get('baseline_hash', '')
+        
+        # Boolean-based SQLi conditions:
+        # 1. True response != False response (payload causes different behavior)
+        # 2. True response ≈ baseline (true condition doesn't break query)
+        # 3. False response significantly differs (false condition affects query)
+        
+        if true_hash and false_hash:
+            if true_hash != false_hash:  # Responses differ
+                entry['pairs_confirmed'] += 1
+                
+                if entry['pairs_confirmed'] >= self.threshold:
+                    # Return combined evidences (both true and false)
+                    combined = entry['true_evidences'][:] + entry['false_evidences'][:]
+                    del self._boolean_pairs[key]
+                    return combined
+                    
+        return None
+
+    def get_confirmation_count(self, key: str) -> int:
+        """Get current confirmation count for a key."""
+        if key in self._store:
+            return len(self._store[key]['payloads'])
+        return 0
+
+    def reset(self, key: Optional[str] = None):
+        """Reset confirmation store. If key provided, only reset that key."""
+        if key:
+            self._store.pop(key, None)
+            self._boolean_pairs.pop(key, None)
+        else:
+            self._store.clear()
+            self._boolean_pairs.clear()
 from ..utils.constants import VulnerabilityType, Severity
 
 
@@ -29,6 +141,8 @@ class BaseDetector(ABC):
         """
         self.name = name
         self.findings: List[Vulnerability] = []
+        # simple confirmation engine shared by detectors; key -> list of evidences
+        self._confirmation_engine = ConfirmationEngine()
         
     @abstractmethod
     async def detect(self, target_url: str, evidence: Dict[str, Any]) -> List[Vulnerability]:
@@ -82,6 +196,7 @@ class BaseDetector(ABC):
             description=description,
             severity=severity,
             confidence=confidence,
+            detection_confidence=kwargs.pop('detection_confidence', None),
             evidence=[evidence],
             scanner_module=self.name,
             **kwargs
